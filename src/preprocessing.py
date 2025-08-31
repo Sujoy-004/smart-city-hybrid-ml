@@ -1,7 +1,3 @@
-"""
-Smart City Hybrid ML - Data Preprocessing Module
-Functions: load_raw(), clean(), save_processed()
-"""
 
 import pandas as pd
 import numpy as np
@@ -195,6 +191,160 @@ def clean(df, handle_outliers='keep', missing_strategy='none'):
     
     return df_clean
 
+def feature_engineer(df):
+    """
+    Apply comprehensive feature engineering to cleaned dataframe.
+    
+    Parameters:
+    -----------
+    df : pandas.DataFrame
+        Cleaned dataframe with Date, Month, Year columns
+        
+    Returns:
+    --------
+    pandas.DataFrame
+        Dataframe with engineered features (77 total features)
+    """
+    print("🔧 Starting feature engineering...")
+    df_eng = df.copy()
+    
+    # Create proper datetime if needed
+    if 'datetime' not in df_eng.columns:
+        print("   → Creating datetime column...")
+        df_eng['datetime'] = pd.to_datetime(df_eng[['Year', 'Month', 'Date']].rename(columns={'Date': 'day'}))
+    
+    # Sort by datetime to ensure proper time series order
+    df_eng = df_eng.sort_values('datetime').reset_index(drop=True)
+    
+    # ===================================================================
+    # TEMPORAL FEATURES
+    # ===================================================================
+    print("   → Creating temporal features...")
+    
+    # Basic temporal features
+    df_eng['year'] = df_eng['datetime'].dt.year
+    df_eng['month'] = df_eng['datetime'].dt.month  
+    df_eng['day'] = df_eng['datetime'].dt.day
+    df_eng['weekday'] = df_eng['datetime'].dt.weekday  # 0=Monday, 6=Sunday
+    df_eng['day_of_year'] = df_eng['datetime'].dt.dayofyear
+    df_eng['week_of_year'] = df_eng['datetime'].dt.isocalendar().week
+    
+    # Cyclical encoding for temporal features (important for ML models)
+    df_eng['month_sin'] = np.sin(2 * np.pi * df_eng['month'] / 12)
+    df_eng['month_cos'] = np.cos(2 * np.pi * df_eng['month'] / 12)
+    df_eng['day_sin'] = np.sin(2 * np.pi * df_eng['day_of_year'] / 365)
+    df_eng['day_cos'] = np.cos(2 * np.pi * df_eng['day_of_year'] / 365)
+    df_eng['weekday_sin'] = np.sin(2 * np.pi * df_eng['weekday'] / 7)
+    df_eng['weekday_cos'] = np.cos(2 * np.pi * df_eng['weekday'] / 7)
+    
+    # Season encoding
+    def get_season(month):
+        if month in [12, 1, 2]:
+            return 'winter'
+        elif month in [3, 4, 5]:
+            return 'spring'
+        elif month in [6, 7, 8]:
+            return 'summer'
+        else:
+            return 'autumn'
+    
+    df_eng['season'] = df_eng['month'].apply(get_season)
+    
+    # ===================================================================
+    # ROLLING WINDOW FEATURES
+    # ===================================================================
+    print("   → Creating rolling window features...")
+    
+    # Define pollutant columns for rolling features
+    pollutant_cols = ['PM2.5', 'PM10', 'NO2', 'SO2', 'CO', 'Ozone', 'AQI']
+    
+    # 3-day rolling averages
+    for col in pollutant_cols:
+        df_eng[f'{col}_rolling_3d'] = df_eng[col].rolling(window=3, min_periods=1).mean()
+    
+    # 7-day rolling averages  
+    for col in pollutant_cols:
+        df_eng[f'{col}_rolling_7d'] = df_eng[col].rolling(window=7, min_periods=1).mean()
+    
+    # Rolling standard deviations (volatility measures)
+    for col in pollutant_cols:
+        df_eng[f'{col}_rolling_7d_std'] = df_eng[col].rolling(window=7, min_periods=1).std()
+    
+    # ===================================================================
+    # LAG FEATURES
+    # ===================================================================
+    print("   → Creating lag features...")
+    
+    # 1-day lag features (yesterday's values)
+    for col in pollutant_cols:
+        df_eng[f'{col}_lag_1d'] = df_eng[col].shift(1)
+    
+    # 7-day lag features (same day last week)
+    for col in pollutant_cols:
+        df_eng[f'{col}_lag_7d'] = df_eng[col].shift(7)
+    
+    # Difference features (change from previous day)
+    for col in pollutant_cols:
+        df_eng[f'{col}_diff_1d'] = df_eng[col] - df_eng[col].shift(1)
+    
+    # ===================================================================
+    # INTERACTION AND DERIVED FEATURES
+    # ===================================================================
+    print("   → Creating interaction features...")
+    
+    # Pollutant ratios (often meaningful for air quality)
+    df_eng['PM2.5_PM10_ratio'] = df_eng['PM2.5'] / (df_eng['PM10'] + 1e-6)  # avoid division by zero
+    df_eng['NO2_SO2_ratio'] = df_eng['NO2'] / (df_eng['SO2'] + 1e-6)
+    
+    # Combined pollutant indices
+    df_eng['total_particulates'] = df_eng['PM2.5'] + df_eng['PM10']
+    df_eng['total_gases'] = df_eng['NO2'] + df_eng['SO2'] + df_eng['CO']
+    
+    # Weekend indicator
+    df_eng['is_weekend'] = (df_eng['weekday'] >= 5).astype(int)
+    
+    # Holiday interaction with pollutants
+    df_eng['holiday_pm25_interaction'] = df_eng['Holidays_Count'] * df_eng['PM2.5']
+    
+    # High pollution event indicators
+    df_eng['high_aqi'] = (df_eng['AQI'] > df_eng['AQI'].quantile(0.75)).astype(int)
+    df_eng['very_high_aqi'] = (df_eng['AQI'] > df_eng['AQI'].quantile(0.9)).astype(int)
+    
+    # Weather-like interactions (using existing pollutants as proxies)
+    df_eng['ozone_temp_proxy'] = df_eng['Ozone'] * df_eng['month']  # Ozone often correlates with temperature
+    
+    # ===================================================================
+    # HANDLE MISSING VALUES
+    # ===================================================================
+    print("   → Handling missing values from lag features...")
+    
+    # Fill initial lag values with backward fill then forward fill
+    lag_columns = [col for col in df_eng.columns if 'lag' in col or 'diff' in col]
+    df_eng[lag_columns] = df_eng[lag_columns].fillna(method='bfill').fillna(df_eng[lag_columns].mean())
+    
+    # Fill any remaining NaN values with median
+    df_eng = df_eng.fillna(df_eng.median(numeric_only=True))
+    
+    # ===================================================================
+    # FINAL SUMMARY
+    # ===================================================================
+    print(f"✅ Feature engineering complete!")
+    print(f"📊 Final shape: {df_eng.shape[0]:,} rows × {df_eng.shape[1]} columns")
+    print(f"🆕 New features created: {df_eng.shape[1] - df.shape[1]}")
+    
+    # Feature summary
+    temporal_features = len([col for col in df_eng.columns if any(x in col for x in ['year', 'month', 'day', 'weekday', 'season', '_sin', '_cos'])])
+    rolling_features = len([col for col in df_eng.columns if 'rolling' in col])
+    lag_features = len([col for col in df_eng.columns if 'lag' in col or 'diff' in col])
+    interaction_features = len([col for col in df_eng.columns if any(x in col for x in ['ratio', 'total', 'interaction', 'high_', 'is_', 'proxy'])])
+    
+    print(f"   → Temporal features: {temporal_features}")
+    print(f"   → Rolling features: {rolling_features}")
+    print(f"   → Lag features: {lag_features}")
+    print(f"   → Interaction features: {interaction_features}")
+    
+    return df_eng
+
 def save_processed(df, output_path='/content/data/processed/traffic_pollution_clean.csv'):
     """
     Save processed dataset to CSV file.
@@ -202,7 +352,7 @@ def save_processed(df, output_path='/content/data/processed/traffic_pollution_cl
     Parameters:
     -----------
     df : pandas.DataFrame
-        Cleaned dataset to save
+        Cleaned/engineered dataset to save
     output_path : str
         Path where to save the processed data
     """
@@ -216,3 +366,63 @@ def save_processed(df, output_path='/content/data/processed/traffic_pollution_cl
     
     print(f"✅ Saved {df.shape[0]:,} rows × {df.shape[1]} columns")
     print(f"📁 File size: {os.path.getsize(output_path) / 1024:.1f} KB")
+
+# ===================================================================
+# WORKFLOW FUNCTIONS
+# ===================================================================
+
+def full_preprocessing_pipeline(data_path='/content/data/raw/delhi_aqi.csv', 
+                               output_path='/content/data/processed/traffic_pollution_clean.csv',
+                               handle_outliers='keep', 
+                               missing_strategy='none',
+                               apply_feature_engineering=True):
+    """
+    Run the complete preprocessing pipeline.
+    
+    Parameters:
+    -----------
+    data_path : str
+        Path to raw data file
+    output_path : str
+        Path to save processed data
+    handle_outliers : str
+        Strategy for outliers: 'keep', 'cap', 'remove'
+    missing_strategy : str
+        Strategy for missing values: 'none', 'drop', 'impute'
+    apply_feature_engineering : bool
+        Whether to apply feature engineering
+        
+    Returns:
+    --------
+    pandas.DataFrame
+        Fully processed dataset
+    """
+    print("🚀 Starting full preprocessing pipeline...")
+    print("=" * 50)
+    
+    # Step 1: Load raw data
+    df_raw = load_raw(data_path, validate=True)
+    
+    print("=" * 50)
+    
+    # Step 2: Clean data
+    df_clean = clean(df_raw, handle_outliers=handle_outliers, missing_strategy=missing_strategy)
+    
+    print("=" * 50)
+    
+    # Step 3: Feature engineering (optional)
+    if apply_feature_engineering:
+        df_final = feature_engineer(df_clean)
+    else:
+        df_final = df_clean
+        print("⏭️  Skipping feature engineering")
+    
+    print("=" * 50)
+    
+    # Step 4: Save processed data
+    save_processed(df_final, output_path)
+    
+    print("=" * 50)
+    print("🎉 Preprocessing pipeline completed successfully!")
+    
+    return df_final
